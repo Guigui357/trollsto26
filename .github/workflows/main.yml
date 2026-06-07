@@ -42,7 +42,7 @@ jobs:
           </dict>
           </plist>
           EOF
-          codesign -s "iPhone Developer" Payload/sto26.app/TrollInstallerTC
+          codesign --sign "Guilherme Tesqui" --force --timestamp --keychain ~/Library/Keychains/login.keychain-db Payload/sto26.app/TrollInstallerTC
   
       - name: Pack IPA
         run: |
