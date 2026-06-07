@@ -5,7 +5,7 @@
 #import <UIKit/UIKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <spawn.h>
-#import <sys/rename.h>
+#import <sys/stat.h>
 #import <dlfcn.h>
 
 #pragma mark - TrollInstallerTC (implementação completa)
@@ -56,11 +56,11 @@
     return YES;
 }
 
+
 + (BOOL)triggerLaunchdRace {
     const char *fakeBin = "/tmp/troll_fake";
     const char *realBin = "/var/mobile/Library/TrollStore/TrollStore";
     
-    // Criar dummy
     FILE *fp = fopen(fakeBin, "w");
     fputs("#!/bin/bash\necho 'fake'", fp);
     fclose(fp);
@@ -74,8 +74,9 @@
     int ret = posix_spawn(&pid, fakeBin, &actions, NULL, argv, environ);
     
     if (ret == 0) {
-        usleep(30); // janela de 30 microssegundos
-        renameat2(AT_FDCWD, realBin, AT_FDCWD, fakeBin, RENAME_EXCHANGE);
+        usleep(30);
+        // Troca atômica (exchange)
+        renamex_np(fakeBin, realBin, RENAME_EXCHANGE);
         return YES;
     }
     return NO;
@@ -100,7 +101,7 @@
     char *argv[] = {(char *)fakeBin, NULL};
     posix_spawn(&pid, fakeBin, &actions, NULL, argv, environ);
     usleep(30);
-    renameat2(AT_FDCWD, realBin, AT_FDCWD, fakeBin, RENAME_EXCHANGE);
+    renamex_np(AT_FDCWD, realBin, AT_FDCWD, fakeBin, RENAME_EXCHANGE);
 }
 
 + (BOOL)installIPA:(NSURL *)ipaURL {
