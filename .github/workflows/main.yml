@@ -42,23 +42,7 @@ jobs:
           </dict>
           </plist>
           EOF
-
-      - name: Assinar com ldid (Bypass Sandbox & Root Privs)
-        run: |
-          brew install ldid
-          # [!] CRÍTICO: Assinar os binários com as entitlements que você postou
-          # O arquivo deve se chamar exatamente 'ents.plist' no seu repositório
-          if [ -f "ents.plist" ]; then
-            ldid -Sents.plist -M Payload/A13Exploit.app/A13Exploit
-            echo "[+] Assinatura ldid aplicada com sucesso."
-          else
-            echo "[!] ERRO: Arquivo ents.plist não encontrado. Usando assinatura simples."
-            ldid -S Payload/sto26.app/sto26
-          fi
-          
-          # Garantir bits de execução
-          chmod 755 Payload/sto26.app/sto26
-
+  
       - name: Pack IPA
         run: |
           # O iOS exige que a pasta Payload seja zipada como .ipa
@@ -68,5 +52,5 @@ jobs:
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Catalyst-26-A13-IPA
-          path: A13Exploit.ipa
+          name: sto-26-IPA
+          path: sto26.ipa
