@@ -5,11 +5,14 @@
 #import <UIKit/UIKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <spawn.h>
-#import <sys/rename.h>
-#import <sys/stat.h>
+#import <sys/stat.h>   // <- substitui sys/rename.h
 #import <stdlib.h>
 
-extern char **environ;  // necessário para posix_spawn
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (0x02)
+#endif
+
+extern char **environ;
 
 #pragma mark - TrollInstallerTC (implementação completa, sem system/NSTask)
 
