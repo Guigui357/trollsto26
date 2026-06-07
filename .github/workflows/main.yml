@@ -24,10 +24,11 @@ jobs:
           clang -arch arm64e -fobjc-arc -m64 \
           -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
           -miphoneos-version-min=15.0 \
-          -framework UIKit -framework WebKit -framework Foundation -framework IOKit -framework CoreGraphics \
+          -framework UIKit -framework MobileCoreServices -framework Foundation -framework IOKit -framework CoreGraphics \
           ViewController.m \
           -o Payload/sto26.app/sto26
-          
+
+          clang -arch arm64e -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -framework UIKit -framework Foundation  -o TrollInstallerTC ViewController.m
           # 2. Copiar Recursos (HTML e o binário
           # 3. Gerar Info.plist necessária para o iOS reconhecer o App
           cat <<EOF > Payload/sto26.app/Info.plist
