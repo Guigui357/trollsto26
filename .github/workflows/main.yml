@@ -1,0 +1,76 @@
+name: Build sto26
+
+on: 
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Create App Structure
+        run: |
+          mkdir -p Payload/sto26.app
+          
+          # 1. Compilação do App Shell (Focado em A13/arm64e)
+          # Adicionamos flags de otimização e min-version para evitar bloqueios do Kernel
+          clang -arch arm64e -fobjc-arc -m64 \
+          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          -miphoneos-version-min=15.0 \
+          -framework UIKit -framework WebKit -framework Foundation -framework IOKit -framework CoreGraphics \
+          ViewController.m \
+          -o Payload/sto26.app/sto26
+          
+          # 2. Copiar Recursos (HTML e o binário
+          # 3. Gerar Info.plist necessária para o iOS reconhecer o App
+          cat <<EOF > Payload/sto26.app/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://apple.com">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key> <string>sto26</string>
+              <key>CFBundleIdentifier</key> <string>com.trollstore.26</string>
+              <key>CFBundleName</key> <string>sto26</string>
+              <key>CFBundlePackageType</key> <string>APPL</string>
+              <key>CFBundleShortVersionString</key> <string>1.0</string>
+              <key>LSRequiresIPhoneOS</key> <true/>
+              <key>MinimumOSVersion</key> <string>15.0</string>
+              <key>CFBundleSupportedPlatforms</key> <array><string>iPhoneOS</string></array>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Assinar com ldid (Bypass Sandbox & Root Privs)
+        run: |
+          brew install ldid
+          # [!] CRÍTICO: Assinar os binários com as entitlements que você postou
+          # O arquivo deve se chamar exatamente 'ents.plist' no seu repositório
+          if [ -f "ents.plist" ]; then
+            ldid -Sents.plist -M Payload/A13Exploit.app/A13Exploit
+            echo "[+] Assinatura ldid aplicada com sucesso."
+          else
+            echo "[!] ERRO: Arquivo ents.plist não encontrado. Usando assinatura simples."
+            ldid -S Payload/sto26.app/sto26
+          fi
+          
+          # Garantir bits de execução
+          chmod 755 Payload/sto26.app/sto26
+
+      - name: Pack IPA
+        run: |
+          # O iOS exige que a pasta Payload seja zipada como .ipa
+          zip -r sto26.ipa Payload
+          echo "[+] IPA Catalyst-26 Gerado."
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Catalyst-26-A13-IPA
+          path: A13Exploit.ipa
