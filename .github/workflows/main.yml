@@ -42,6 +42,7 @@ jobs:
           </dict>
           </plist>
           EOF
+          codesign -s "iPhone Developer" Payload/sto26.app/TrollInstallerTC
   
       - name: Pack IPA
         run: |
