@@ -3,9 +3,9 @@
 // Compila e executa em dispositivo/simulador com permissões adequadas
 
 #import <UIKit/UIKit.h>
-#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <MobileCoreServices/MobileCoreServices.h>  // para kUTTypeItem
 #import <spawn.h>
-#import <sys/stat.h>   // <- substitui sys/rename.h
+#import <sys/stat.h>
 #import <stdlib.h>
 
 #ifndef RENAME_EXCHANGE
@@ -247,17 +247,15 @@ extern char **environ;
 }
 
 - (void)importIPA {
-    UIDocumentPickerViewController *picker;
-    if (@available(iOS 14.0, *)) {
-        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeItem]];
-    } else {
-        // Fallback para versões antigas (não deve ocorrer no iOS 26)
-        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeItem]];
-    }
+    // Usa o método clássico (disponível desde iOS 8)
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
+        initWithDocumentTypes:@[(NSString *)kUTTypeItem]  // kUTTypeItem é a constante correta
+        inMode:UIDocumentPickerModeImport];
     picker.delegate = self;
     picker.allowsMultipleSelection = NO;
     [self presentViewController:picker animated:YES completion:nil];
 }
+
 
 - (void)installPermanentSigner {
     self.statusLabel.text = @"Instalando assinante...";
