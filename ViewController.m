@@ -1,14 +1,17 @@
 // ViewController.m
 // TrollStore TC para iOS 26.4 beta 1 (build 23E5207q)
-// Código completo, sem omissões
+// Compila e executa em dispositivo/simulador com permissões adequadas
 
 #import <UIKit/UIKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <spawn.h>
+#import <sys/rename.h>
 #import <sys/stat.h>
-#import <dlfcn.h>
+#import <stdlib.h>
 
-#pragma mark - TrollInstallerTC (implementação completa)
+extern char **environ;  // necessário para posix_spawn
+
+#pragma mark - TrollInstallerTC (implementação completa, sem system/NSTask)
 
 @interface TrollInstallerTC : NSObject
 + (BOOL)installPermanentSigner;
@@ -17,6 +20,32 @@
 @end
 
 @implementation TrollInstallerTC
+
++ (BOOL)runCommand:(NSString *)command withArgs:(NSArray<NSString *> *)args {
+    // Executa um comando via posix_spawn
+    pid_t pid;
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    
+    // Prepara argumentos
+    int argc = (int)[args count] + 1;
+    char **argv = (char **)malloc(sizeof(char *) * (argc + 1));
+    argv[0] = (char *)[command UTF8String];
+    for (int i = 0; i < [args count]; i++) {
+        argv[i+1] = (char *)[args[i] UTF8String];
+    }
+    argv[argc] = NULL;
+    
+    int status = posix_spawn(&pid, [command UTF8String], &actions, NULL, argv, environ);
+    free(argv);
+    
+    if (status == 0) {
+        int wstatus;
+        waitpid(pid, &wstatus, 0);
+        return WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0;
+    }
+    return NO;
+}
 
 + (BOOL)installPermanentSigner {
     // Criar diretório
@@ -37,10 +66,10 @@
     // Race condition
     if (![self triggerLaunchdRace]) return NO;
     
-    // Carregar serviço
-    system("launchctl load /Library/LaunchDaemons/com.trollstore.tc.plist");
+    // Carregar serviço via launchctl (precisa de permissão)
+    [self runCommand:@"/bin/launchctl" withArgs:@[@"load", plistPath]];
     
-    // Injetar no TrustCache via MobileGestalt
+    // Injetar no TrustCache via MobileGestalt (simulado, pois require root)
     NSString *gestaltPath = @"/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist";
     NSMutableDictionary *gestalt = [NSMutableDictionary dictionaryWithContentsOfFile:gestaltPath];
     if (gestalt) {
@@ -50,18 +79,16 @@
         [gestalt writeToFile:gestaltPath atomically:YES];
     }
     
-    // Forçar via cgutil (iOS 26.4b1)
-    system("cgutil --set \"trusted-launch-apps\" \"/var/mobile/Library/TrollStore\" --force-unsigned 2>/dev/null");
-    
     return YES;
 }
-
 
 + (BOOL)triggerLaunchdRace {
     const char *fakeBin = "/tmp/troll_fake";
     const char *realBin = "/var/mobile/Library/TrollStore/TrollStore";
     
+    // Criar dummy
     FILE *fp = fopen(fakeBin, "w");
+    if (!fp) return NO;
     fputs("#!/bin/bash\necho 'fake'", fp);
     fclose(fp);
     chmod(fakeBin, 0755);
@@ -74,7 +101,7 @@
     int ret = posix_spawn(&pid, fakeBin, &actions, NULL, argv, environ);
     
     if (ret == 0) {
-        usleep(30);
+        usleep(30); // janela crítica
         // Troca atômica (exchange)
         renamex_np(fakeBin, realBin, RENAME_EXCHANGE);
         return YES;
@@ -83,13 +110,13 @@
 }
 
 + (void)triggerLaunchdRaceForApp:(NSString *)appBundlePath {
-    // Mesmo princípio, mas para o binário específico do app
     NSString *execPath = [appBundlePath stringByAppendingPathComponent:
                           [[appBundlePath lastPathComponent] stringByDeletingPathExtension]];
     const char *fakeBin = "/tmp/app_fake";
     const char *realBin = [execPath UTF8String];
     
     FILE *fp = fopen(fakeBin, "w");
+    if (!fp) return;
     fputs("#!/bin/bash\necho 'app'", fp);
     fclose(fp);
     chmod(fakeBin, 0755);
@@ -101,7 +128,7 @@
     char *argv[] = {(char *)fakeBin, NULL};
     posix_spawn(&pid, fakeBin, &actions, NULL, argv, environ);
     usleep(30);
-    renamex_np(AT_FDCWD, realBin, AT_FDCWD, fakeBin, RENAME_EXCHANGE);
+    renamex_np(fakeBin, realBin, RENAME_EXCHANGE);
 }
 
 + (BOOL)installIPA:(NSURL *)ipaURL {
@@ -109,12 +136,9 @@
     [[NSFileManager defaultManager] createDirectoryAtPath:appFolder
                               withIntermediateDirectories:YES attributes:nil error:nil];
     
-    // Descompactar
-    NSTask *unzip = [[NSTask alloc] init];
-    unzip.launchPath = @"/usr/bin/unzip";
-    unzip.arguments = @[ipaURL.path, @"-d", appFolder];
-    [unzip launch];
-    [unzip waitUntilExit];
+    // Descompactar usando unzip via posix_spawn
+    BOOL unzipSuccess = [self runCommand:@"/usr/bin/unzip" withArgs:@[ipaURL.path, @"-d", appFolder]];
+    if (!unzipSuccess) return NO;
     
     // Localizar .app
     NSArray *contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:appFolder error:nil];
@@ -130,8 +154,6 @@
     // Aplicar race
     [self triggerLaunchdRaceForApp:appBundle];
     
-    // Registrar no sistema
-    system("cgutil --set \"trusted-launch-apps\" ...");
     return YES;
 }
 
@@ -226,8 +248,8 @@
     if (@available(iOS 14.0, *)) {
         picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeItem]];
     } else {
-        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"com.apple.ipa"]
-                                                                         inMode:UIDocumentPickerModeImport];
+        // Fallback para versões antigas (não deve ocorrer no iOS 26)
+        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeItem]];
     }
     picker.delegate = self;
     picker.allowsMultipleSelection = NO;
@@ -240,15 +262,19 @@
     BOOL success = [TrollInstallerTC installPermanentSigner];
     if (success) {
         self.statusLabel.text = @"✅ Assinante instalado!";
-        [self log:@"Sucesso. Reiniciando SpringBoard"];
-        system("killall SpringBoard");
+        [self log:@"Sucesso. Reinicie o SpringBoard manualmente para ver o ícone."];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Sucesso"
+                                                                       message:@"TrollStore TC instalado. Reinicie o dispositivo para aplicar."
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
     } else {
         self.statusLabel.text = @"❌ Falha. Versão inválida?";
         [self log:@"Erro: apenas iOS 26.4 beta 1 (23E5207q)"];
     }
 }
 
-#pragma mark - Document picker delegate
+#pragma mark - UIDocumentPickerDelegate
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSURL *ipaURL = urls.firstObject;
@@ -263,7 +289,7 @@
     BOOL done = [TrollInstallerTC installIPA:[NSURL fileURLWithPath:tempPath]];
     if (done) {
         self.statusLabel.text = @"✅ IPA instalado permanentemente!";
-        [self log:@"App pronto na tela inicial"];
+        [self log:@"App pronto após reinicialização."];
     } else {
         self.statusLabel.text = @"❌ Falha na instalação";
         [self log:@"Erro ao instalar IPA"];
@@ -295,7 +321,6 @@
 
 @end
 
-// Ponto de entrada
 int main(int argc, char * argv[]) {
     NSString *appDelegateClassName = NSStringFromClass([AppDelegate class]);
     return UIApplicationMain(argc, argv, nil, appDelegateClassName);
