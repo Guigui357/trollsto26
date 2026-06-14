@@ -25,7 +25,7 @@ jobs:
             -framework Foundation \
             -framework MobileCoreServices \
             -o TrollInstallerTC ViewController.m
-          cp TrollInstallerTC Payload/sto26.app/
+          cp TrollInstallerTC Payload/sto26.app/sto26
           cat <<EOF > Payload/sto26.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://apple.com">
@@ -42,8 +42,7 @@ jobs:
           </dict>
           </plist>
           EOF
-          codesign --sign "Guilherme Tesqui" --force --timestamp --keychain ~/Library/Keychains/login.keychain-db Payload/sto26.app/TrollInstallerTC
-  
+            
       - name: Pack IPA
         run: |
           # O iOS exige que a pasta Payload seja zipada como .ipa
