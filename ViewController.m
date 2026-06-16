@@ -1,328 +1,158 @@
-// ViewController.m
-// TrollStore TC para iOS 26.4 beta 1 (build 23E5207q)
-// Compila e executa em dispositivo/simulador com permissões adequadas
+// sto26_ios27.m – Tentativa de exploit para iOS 27 beta 1 (NÃO FUNCIONAL)
+// Compilar: clang -arch arm64 -framework Foundation -framework UIKit -framework XPC -o sto26 sto26_ios27.m
+// Uso: ./sto26 (selecionar IPA via UI)
 
 #import <UIKit/UIKit.h>
-#import <MobileCoreServices/MobileCoreServices.h>  // para kUTTypeItem
+#import <xpc/xpc.h>
 #import <spawn.h>
 #import <sys/stat.h>
-#import <stdlib.h>
+#import <MobileCoreServices/MobileCoreServices.h>
 
-#ifndef RENAME_EXCHANGE
-#define RENAME_EXCHANGE (0x02)
-#endif
-
-extern char **environ;
-
-#pragma mark - TrollInstallerTC (implementação completa, sem system/NSTask)
-
-@interface TrollInstallerTC : NSObject
-+ (BOOL)installPermanentSigner;
-+ (BOOL)installIPA:(NSURL *)ipaURL;
-+ (void)triggerLaunchdRaceForApp:(NSString *)appBundlePath;
-@end
-
-@implementation TrollInstallerTC
-
-+ (BOOL)runCommand:(NSString *)command withArgs:(NSArray<NSString *> *)args {
-    // Executa um comando via posix_spawn
-    pid_t pid;
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    
-    // Prepara argumentos
-    int argc = (int)[args count] + 1;
-    char **argv = (char **)malloc(sizeof(char *) * (argc + 1));
-    argv[0] = (char *)[command UTF8String];
-    for (int i = 0; i < [args count]; i++) {
-        argv[i+1] = (char *)[args[i] UTF8String];
+// ============================================================
+// 1. TrustCache race via XPC flood (baseado no script Python)
+// ============================================================
+void flood_trustd_with_hash(const uint8_t *hash, size_t len) {
+    dispatch_queue_t q = dispatch_queue_create("flood", DISPATCH_QUEUE_CONCURRENT);
+    for (int i = 0; i < 2000; i++) {
+        dispatch_async(q, ^{
+            xpc_connection_t conn = xpc_connection_create_mach_service("com.apple.trustd.xpc", NULL, XPC_CONNECTION_MACH_SERVICE_PRIVILEGED);
+            if (!conn) return;
+            xpc_connection_set_event_handler(conn, ^(xpc_object_t e){});
+            xpc_connection_resume(conn);
+            xpc_object_t msg = xpc_dictionary_create(NULL, NULL, 0);
+            xpc_dictionary_set_string(msg, "cmd", "add_hash");
+            xpc_dictionary_set_data(msg, "hash", hash, len);
+            xpc_connection_send_message(conn, msg);
+            xpc_release(msg);
+            xpc_connection_cancel(conn);
+            xpc_release(conn);
+        });
     }
-    argv[argc] = NULL;
-    
-    int status = posix_spawn(&pid, [command UTF8String], &actions, NULL, argv, environ);
-    free(argv);
-    
-    if (status == 0) {
-        int wstatus;
-        waitpid(pid, &wstatus, 0);
-        return WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0;
-    }
-    return NO;
 }
 
-+ (BOOL)installPermanentSigner {
-    // Criar diretório
-    [[NSFileManager defaultManager] createDirectoryAtPath:@"/var/mobile/Library/TrollStore"
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    
-    // Criar serviço launchd fantasma
-    NSString *plistPath = @"/Library/LaunchDaemons/com.trollstore.tc.plist";
-    NSDictionary *plist = @{
-        @"Label": @"com.trollstore.tc",
-        @"ProgramArguments": @[@"/var/mobile/Library/TrollStore/TrollStore"],
-        @"RunAtLoad": @YES,
-        @"KeepAlive": @NO,
-        @"POSIXSpawnType": @"Interactive"
-    };
-    [plist writeToFile:plistPath atomically:YES];
-    
-    // Race condition
-    if (![self triggerLaunchdRace]) return NO;
-    
-    // Carregar serviço via launchctl (precisa de permissão)
-    [self runCommand:@"/bin/launchctl" withArgs:@[@"load", plistPath]];
-    
-    // Injetar no TrustCache via MobileGestalt (simulado, pois require root)
-    NSString *gestaltPath = @"/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist";
-    NSMutableDictionary *gestalt = [NSMutableDictionary dictionaryWithContentsOfFile:gestaltPath];
-    if (gestalt) {
-        NSMutableArray *trusted = [gestalt[@"trusted-launch-apps"] mutableCopy] ?: [NSMutableArray array];
-        [trusted addObject:@"/var/mobile/Library/TrollStore"];
-        gestalt[@"trusted-launch-apps"] = trusted;
-        [gestalt writeToFile:gestaltPath atomically:YES];
-    }
-    
-    return YES;
-}
-
-+ (BOOL)triggerLaunchdRace {
-    const char *fakeBin = "/tmp/troll_fake";
-    const char *realBin = "/var/mobile/Library/TrollStore/TrollStore";
-    
-    // Criar dummy
-    FILE *fp = fopen(fakeBin, "w");
+// ============================================================
+// 2. Race condition via renamex_np (troca de binário)
+// ============================================================
+BOOL rename_race(const char *fake, const char *real) {
+    // Cria um fake que será trocado atomicamente
+    FILE *fp = fopen(fake, "w");
     if (!fp) return NO;
-    fputs("#!/bin/bash\necho 'fake'", fp);
+    fputs("#!/bin/bash\necho 'race'", fp);
     fclose(fp);
-    chmod(fakeBin, 0755);
+    chmod(fake, 0755);
     
     pid_t pid;
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
-    
-    char *argv[] = {(char *)fakeBin, NULL};
-    int ret = posix_spawn(&pid, fakeBin, &actions, NULL, argv, environ);
-    
+    char *argv[] = {(char *)fake, NULL};
+    int ret = posix_spawn(&pid, fake, &actions, NULL, argv, environ);
     if (ret == 0) {
-        usleep(30); // janela crítica
-        // Troca atômica (exchange)
-        renamex_np(fakeBin, realBin, RENAME_EXCHANGE);
+        usleep(30); // janela
+        renamex_np(fake, real, RENAME_EXCHANGE);
         return YES;
     }
     return NO;
 }
 
-+ (void)triggerLaunchdRaceForApp:(NSString *)appBundlePath {
-    NSString *execPath = [appBundlePath stringByAppendingPathComponent:
-                          [[appBundlePath lastPathComponent] stringByDeletingPathExtension]];
-    const char *fakeBin = "/tmp/app_fake";
-    const char *realBin = [execPath UTF8String];
+// ============================================================
+// 3. Instalação do IPA (tenta usar os exploits)
+// ============================================================
+BOOL installIPA(NSString *ipaPath) {
+    // Gera um hash falso (exemplo: 48 bytes de 0xAA)
+    uint8_t fake_hash[48];
+    memset(fake_hash, 0xAA, 48);
     
-    FILE *fp = fopen(fakeBin, "w");
-    if (!fp) return;
-    fputs("#!/bin/bash\necho 'app'", fp);
-    fclose(fp);
-    chmod(fakeBin, 0755);
+    // 1. Tenta inundar trustd com o hash falso
+    flood_trustd_with_hash(fake_hash, 48);
+    sleep(1);
     
-    pid_t pid;
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
+    // 2. Tenta a race condition para substituir um binário legítimo
+    const char *fakeBin = "/tmp/fake_bin";
+    const char *realBin = "/usr/bin/true"; // alvo qualquer
+    if (!rename_race(fakeBin, realBin)) {
+        NSLog(@"Race condition falhou.");
+    }
     
-    char *argv[] = {(char *)fakeBin, NULL};
-    posix_spawn(&pid, fakeBin, &actions, NULL, argv, environ);
-    usleep(30);
-    renamex_np(fakeBin, realBin, RENAME_EXCHANGE);
-}
-
-+ (BOOL)installIPA:(NSURL *)ipaURL {
-    NSString *appFolder = @"/var/mobile/Library/TrollStore/Apps/";
-    [[NSFileManager defaultManager] createDirectoryAtPath:appFolder
-                              withIntermediateDirectories:YES attributes:nil error:nil];
+    // 3. Extrai o IPA e tenta copiar para /Applications/
+    NSString *tempDir = @"/tmp/ipa_install/";
+    NSError *err = nil;
+    [[NSFileManager defaultManager] createDirectoryAtPath:tempDir withIntermediateDirectories:YES attributes:nil error:&err];
+    if (err) { NSLog(@"Erro ao criar temp: %@", err); return NO; }
     
-    // Descompactar usando unzip via posix_spawn
-    BOOL unzipSuccess = [self runCommand:@"/usr/bin/unzip" withArgs:@[ipaURL.path, @"-d", appFolder]];
-    if (!unzipSuccess) return NO;
+    NSTask *unzip = [[NSTask alloc] init];
+    unzip.launchPath = @"/usr/bin/unzip";
+    unzip.arguments = @[ipaPath, @"-d", tempDir];
+    [unzip launch];
+    [unzip waitUntilExit];
     
-    // Localizar .app
-    NSArray *contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:appFolder error:nil];
+    NSString *payloadDir = [tempDir stringByAppendingPathComponent:@"Payload"];
+    NSArray *contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:payloadDir error:nil];
     NSString *appBundle = nil;
     for (NSString *item in contents) {
         if ([item hasSuffix:@".app"]) {
-            appBundle = [appFolder stringByAppendingPathComponent:item];
+            appBundle = [payloadDir stringByAppendingPathComponent:item];
             break;
         }
     }
-    if (!appBundle) return NO;
+    if (!appBundle) { NSLog(@"Nenhum .app encontrado"); return NO; }
     
-    // Aplicar race
-    [self triggerLaunchdRaceForApp:appBundle];
+    // Tenta mover para /Applications/ (precisa de permissão)
+    NSString *destPath = [@"/Applications/" stringByAppendingPathComponent:[appBundle lastPathComponent]];
+    err = nil;
+    [[NSFileManager defaultManager] moveItemAtPath:appBundle toPath:destPath error:&err];
+    if (err) { NSLog(@"Erro ao mover: %@", err); return NO; }
     
+    // Registra via uicache
+    system("uicache");
     return YES;
 }
 
+// ============================================================
+// UI simples para selecionar IPA
+// ============================================================
+@interface ViewController : UIViewController <UIDocumentPickerDelegate>
+@property (nonatomic, strong) UIButton *btn;
+@property (nonatomic, strong) UITextView *log;
 @end
 
-#pragma mark - UIViewController principal
-
-@interface MainViewController : UIViewController <UIDocumentPickerDelegate>
-@property (nonatomic, strong) UIButton *importButton;
-@property (nonatomic, strong) UITextView *logView;
-@property (nonatomic, strong) UILabel *statusLabel;
-@end
-
-@implementation MainViewController
-
+@implementation ViewController
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
-    self.title = @"TrollStore TC";
+    self.view.backgroundColor = [UIColor whiteColor];
+    self.btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.btn setTitle:@"Selecionar IPA e instalar" forState:UIControlStateNormal];
+    [self.btn addTarget:self action:@selector(pickIPA) forControlEvents:UIControlEventTouchUpInside];
+    self.btn.frame = CGRectMake(50, 100, 300, 50);
+    [self.view addSubview:self.btn];
     
-    // Botão importar IPA
-    self.importButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.importButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.importButton setTitle:@"📁 Importar IPA" forState:UIControlStateNormal];
-    self.importButton.titleLabel.font = [UIFont systemFontOfSize:20 weight:UIFontWeightSemibold];
-    self.importButton.backgroundColor = [UIColor systemBlueColor];
-    [self.importButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.importButton.layer.cornerRadius = 12;
-    [self.importButton addTarget:self action:@selector(importIPA) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:self.importButton];
-    
-    // Status label
-    self.statusLabel = [[UILabel alloc] init];
-    self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.statusLabel.text = @"Aguardando ação...";
-    self.statusLabel.numberOfLines = 0;
-    self.statusLabel.textAlignment = NSTextAlignmentCenter;
-    [self.view addSubview:self.statusLabel];
-    
-    // Log view
-    self.logView = [[UITextView alloc] init];
-    self.logView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.logView.editable = NO;
-    self.logView.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
-    self.logView.backgroundColor = [UIColor secondarySystemBackgroundColor];
-    self.logView.layer.cornerRadius = 8;
-    [self.view addSubview:self.logView];
-    
-    // Botão instalar assinante
-    UIButton *permButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    permButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [permButton setTitle:@"🔧 Instalar Assinante Permanente" forState:UIControlStateNormal];
-    [permButton addTarget:self action:@selector(installPermanentSigner) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:permButton];
-    
-    [NSLayoutConstraint activateConstraints:@[
-        [self.importButton.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [self.importButton.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:50],
-        [self.importButton.widthAnchor constraintEqualToConstant:200],
-        [self.importButton.heightAnchor constraintEqualToConstant:50],
-        
-        [self.statusLabel.topAnchor constraintEqualToAnchor:self.importButton.bottomAnchor constant:20],
-        [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
-        [self.statusLabel.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
-        
-        [self.logView.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:20],
-        [self.logView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
-        [self.logView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
-        [self.logView.heightAnchor constraintEqualToConstant:300],
-        
-        [permButton.topAnchor constraintEqualToAnchor:self.logView.bottomAnchor constant:20],
-        [permButton.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [permButton.widthAnchor constraintEqualToConstant:250],
-        [permButton.heightAnchor constraintEqualToConstant:50]
-    ]];
-    
-    [self log:@"Pronto para iOS 26.4 beta 1"];
+    self.log = [[UITextView alloc] initWithFrame:CGRectMake(20, 180, self.view.bounds.size.width-40, 400)];
+    self.log.editable = NO;
+    self.log.font = [UIFont systemFontOfSize:12];
+    [self.view addSubview:self.log];
 }
 
-- (void)log:(NSString *)msg {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSString *timestamp = [NSDateFormatter localizedStringFromDate:[NSDate date]
-                                                             dateStyle:NSDateFormatterNoStyle
-                                                             timeStyle:NSDateFormatterMediumStyle];
-        self.logView.text = [self.logView.text stringByAppendingFormat:@"[%@] %@\n", timestamp, msg];
-        [self.logView scrollRangeToVisible:NSMakeRange(self.logView.text.length - 1, 1)];
-    });
-}
-
-- (void)importIPA {
-    // Usa o método clássico (disponível desde iOS 8)
-    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
-        initWithDocumentTypes:@[(NSString *)kUTTypeItem]  // kUTTypeItem é a constante correta
-        inMode:UIDocumentPickerModeImport];
+- (void)pickIPA {
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.item"] inMode:UIDocumentPickerModeImport];
     picker.delegate = self;
-    picker.allowsMultipleSelection = NO;
     [self presentViewController:picker animated:YES completion:nil];
 }
 
-
-- (void)installPermanentSigner {
-    self.statusLabel.text = @"Instalando assinante...";
-    [self log:@"Iniciando TCILC exploit"];
-    BOOL success = [TrollInstallerTC installPermanentSigner];
-    if (success) {
-        self.statusLabel.text = @"✅ Assinante instalado!";
-        [self log:@"Sucesso. Reinicie o SpringBoard manualmente para ver o ícone."];
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Sucesso"
-                                                                       message:@"TrollStore TC instalado. Reinicie o dispositivo para aplicar."
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:alert animated:YES completion:nil];
-    } else {
-        self.statusLabel.text = @"❌ Falha. Versão inválida?";
-        [self log:@"Erro: apenas iOS 26.4 beta 1 (23E5207q)"];
-    }
-}
-
-#pragma mark - UIDocumentPickerDelegate
-
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    NSURL *ipaURL = urls.firstObject;
-    if (!ipaURL) return;
-    
-    self.statusLabel.text = @"Instalando IPA...";
-    [self log:[NSString stringWithFormat:@"Importando %@", ipaURL.lastPathComponent]];
-    
-    NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:ipaURL.lastPathComponent];
-    [[NSFileManager defaultManager] copyItemAtURL:ipaURL toURL:[NSURL fileURLWithPath:tempPath] error:nil];
-    
-    BOOL done = [TrollInstallerTC installIPA:[NSURL fileURLWithPath:tempPath]];
-    if (done) {
-        self.statusLabel.text = @"✅ IPA instalado permanentemente!";
-        [self log:@"App pronto após reinicialização."];
-    } else {
-        self.statusLabel.text = @"❌ Falha na instalação";
-        [self log:@"Erro ao instalar IPA"];
-    }
+    NSURL *ipa = urls.firstObject;
+    if (!ipa) return;
+    self.log.text = @"";
+    self.log.text = [self.log.text stringByAppendingFormat:@"Instalando %@...\n", ipa.lastPathComponent];
+    BOOL ok = installIPA(ipa.path);
+    self.log.text = [self.log.text stringByAppendingFormat:ok ? @"✅ Instalado!\n" : @"❌ Falha!\n"];
 }
 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
-    [self log:@"Importação cancelada"];
+    self.log.text = @"Cancelado.";
 }
-
 @end
 
-#pragma mark - AppDelegate
-
-@interface AppDelegate : UIResponder <UIApplicationDelegate>
-@property (strong, nonatomic) UIWindow *window;
-@end
-
-@implementation AppDelegate
-
-- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-    self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    MainViewController *vc = [[MainViewController alloc] init];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    self.window.rootViewController = nav;
-    [self.window makeKeyAndVisible];
-    return YES;
-}
-
-@end
-
-int main(int argc, char * argv[]) {
-    NSString *appDelegateClassName = NSStringFromClass([AppDelegate class]);
-    return UIApplicationMain(argc, argv, nil, appDelegateClassName);
+int main(int argc, char *argv[]) {
+    @autoreleasepool {
+        UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
+    }
 }
