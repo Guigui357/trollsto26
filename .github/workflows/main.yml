@@ -18,6 +18,7 @@ jobs:
       - name: Create App Structure
         run: |
           mkdir -p Payload/sto26.app
+          brew install ldid
           # Encontre o SDK do iPhone
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           clang -arch arm64e -isysroot $SDK \
@@ -42,7 +43,7 @@ jobs:
           </dict>
           </plist>
           EOF
-            
+          ldid -Sents.plist Payload/sto26.app/sto26
       - name: Pack IPA
         run: |
           # O iOS exige que a pasta Payload seja zipada como .ipa
