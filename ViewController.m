@@ -1,8 +1,10 @@
 // ViewController.m – Instalador com UI, forward declarations e logs
 #import <UIKit/UIKit.h>
-#import <MobileCoreServices/MobileCoreServices.h>
+#import <MobileCoreServices/MobileCoreServices.h>  // Para kUTTypeItem
 #import <spawn.h>
 #import <dlfcn.h>
+
+extern char **environ;  // <-- CORREÇÃO 1: declaração de environ
 
 // ============================================================
 // FORWARD DECLARATIONS (API privada)
@@ -60,8 +62,10 @@
 // Selecionar IPA
 // ============================================================
 - (void)pickIPA {
+    // CORREÇÃO 2: usar kUTTypeItem (importado de MobileCoreServices)
     UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
-        initForOpeningContentTypes:@[[UTType typeWithIdentifier:@"public.item"]]];
+        initWithDocumentTypes:@[(NSString *)kUTTypeItem]
+        inMode:UIDocumentPickerModeImport];
     picker.delegate = self;
     picker.allowsMultipleSelection = NO;
     [self presentViewController:picker animated:YES completion:nil];
