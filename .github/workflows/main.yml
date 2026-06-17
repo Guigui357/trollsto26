@@ -25,7 +25,7 @@ jobs:
             -framework UIKit \
             -framework Foundation \
             -framework MobileCoreServices \
-            -o TrollInstallerTC ViewController.m
+            -o TrollInstallerTC ViewController.m AppDelegate.m main.m
           cp TrollInstallerTC Payload/sto26.app/sto26
           cat <<EOF > Payload/sto26.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
