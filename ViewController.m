@@ -1,22 +1,17 @@
-// ViewController.m – Instalador com UI, forward declarations e logs
+// ViewController.m – Instalador com UI e LSApplicationWorkspace
 #import <UIKit/UIKit.h>
-#import <MobileCoreServices/MobileCoreServices.h>  // Para kUTTypeItem
+#import <MobileCoreServices/MobileCoreServices.h>
 #import <spawn.h>
 #import <dlfcn.h>
 
-extern char **environ;  // <-- CORREÇÃO 1: declaração de environ
+extern char **environ;
 
-// ============================================================
-// FORWARD DECLARATIONS (API privada)
-// ============================================================
+// Forward declaration da API privada
 @interface LSApplicationWorkspace : NSObject
 + (id)defaultWorkspace;
 - (BOOL)installApplication:(NSURL *)bundleURL withOptions:(NSDictionary *)options error:(NSError **)error;
 @end
 
-// ============================================================
-// UIViewController
-// ============================================================
 @interface ViewController : UIViewController <UIDocumentPickerDelegate>
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, strong) UIButton *selectButton;
@@ -29,14 +24,12 @@ extern char **environ;  // <-- CORREÇÃO 1: declaração de environ
     self.view.backgroundColor = [UIColor whiteColor];
     self.title = @"sto26 Installer";
     
-    // Botão
     self.selectButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.selectButton setTitle:@"📁 Selecionar IPA e instalar" forState:UIControlStateNormal];
     [self.selectButton addTarget:self action:@selector(pickIPA) forControlEvents:UIControlEventTouchUpInside];
     self.selectButton.frame = CGRectMake(20, 100, self.view.bounds.size.width - 40, 50);
     [self.view addSubview:self.selectButton];
     
-    // TextView para logs
     self.logView = [[UITextView alloc] initWithFrame:CGRectMake(20, 170, self.view.bounds.size.width - 40, 400)];
     self.logView.editable = NO;
     self.logView.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
@@ -58,11 +51,7 @@ extern char **environ;  // <-- CORREÇÃO 1: declaração de environ
     });
 }
 
-// ============================================================
-// Selecionar IPA
-// ============================================================
 - (void)pickIPA {
-    // CORREÇÃO 2: usar kUTTypeItem (importado de MobileCoreServices)
     UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
         initWithDocumentTypes:@[(NSString *)kUTTypeItem]
         inMode:UIDocumentPickerModeImport];
@@ -82,9 +71,6 @@ extern char **environ;  // <-- CORREÇÃO 1: declaração de environ
     [self log:@"Cancelado."];
 }
 
-// ============================================================
-// Extrair e instalar (usando Documents)
-// ============================================================
 - (void)installIPA:(NSString *)ipaPath {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         [self log:@"🔧 Extraindo IPA..."];
@@ -92,11 +78,9 @@ extern char **environ;  // <-- CORREÇÃO 1: declaração de environ
         NSString *docPath = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
         NSString *extractDir = [docPath stringByAppendingPathComponent:@"ipa_extract"];
         
-        // Limpa extração anterior
         [[NSFileManager defaultManager] removeItemAtPath:extractDir error:nil];
         [[NSFileManager defaultManager] createDirectoryAtPath:extractDir withIntermediateDirectories:YES attributes:nil error:nil];
         
-        // Extrai com unzip via posix_spawn
         pid_t pid;
         char *argv[] = {"/usr/bin/unzip", "-q", (char *)[ipaPath UTF8String], "-d", (char *)[extractDir UTF8String], NULL};
         int status = posix_spawn(&pid, argv[0], NULL, NULL, argv, environ);
@@ -107,7 +91,6 @@ extern char **environ;  // <-- CORREÇÃO 1: declaração de environ
         }
         [self log:@"✅ Extração concluída."];
         
-        // Localiza o .app
         NSString *payloadDir = [extractDir stringByAppendingPathComponent:@"Payload"];
         NSArray *contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:payloadDir error:nil];
         NSString *appBundle = nil;
@@ -124,7 +107,6 @@ extern char **environ;  // <-- CORREÇÃO 1: declaração de environ
         }
         [self log:[NSString stringWithFormat:@"📱 App encontrado: %@", appBundle.lastPathComponent]];
         
-        // Tenta instalar via LSApplicationWorkspace
         [self log:@"🔧 Tentando instalar via LSApplicationWorkspace..."];
         BOOL installed = [self installViaWorkspace:appBundle];
         
@@ -138,9 +120,6 @@ extern char **environ;  // <-- CORREÇÃO 1: declaração de environ
     });
 }
 
-// ============================================================
-// Instalação via LSApplicationWorkspace
-// ============================================================
 - (BOOL)installViaWorkspace:(NSString *)appPath {
     Class cls = NSClassFromString(@"LSApplicationWorkspace");
     if (!cls) {
@@ -172,9 +151,6 @@ extern char **environ;  // <-- CORREÇÃO 1: declaração de environ
     }
 }
 
-// ============================================================
-// Alerta
-// ============================================================
 - (void)showAlert:(NSString *)title message:(NSString *)message {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
