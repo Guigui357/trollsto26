@@ -22,10 +22,9 @@ jobs:
           # Encontre o SDK do iPhone
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           clang -arch arm64e -isysroot $SDK \
-            -framework UIKit \
-            -framework Foundation \
-            -framework MobileCoreServices -lz \
-            -framework UniformTypeIdentifiers \
+            -framework UIKit -framework IOKit \
+            -framework Foundation -framework WebKit \
+            -framework MobileCoreServices -framework UniformTypeIdentifiers \
             -o TrollInstallerTC ViewController.m
           cp TrollInstallerTC Payload/sto26.app/sto26
           cat <<EOF > Payload/sto26.app/Info.plist
