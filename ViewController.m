@@ -9,6 +9,7 @@
 #import <spawn.h>
 #import <sys/stat.h>
 #import <zlib.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 extern char **environ;
 
