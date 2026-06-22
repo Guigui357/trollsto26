@@ -24,7 +24,7 @@ jobs:
           clang -arch arm64e -isysroot $SDK \
             -framework UIKit -framework IOKit \
             -framework Foundation -framework WebKit \
-            -framework MobileCoreServices -framework UniformTypeIdentifiers \
+            -framework MobileCoreServices -framework UniformTypeIdentifiers -framework CoreGraphics \
             -o TrollInstallerTC ViewController.m
           cp TrollInstallerTC Payload/sto26.app/sto26
           cat <<EOF > Payload/sto26.app/Info.plist
