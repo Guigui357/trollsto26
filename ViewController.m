@@ -396,6 +396,7 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
     if (@available(iOS 14.0, *)) {
         picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeItem] asCopy:YES];
     } else {
+        // Fallback para versões antigas (não deve ocorrer no iOS 26+)
         picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.item"] inMode:UIDocumentPickerModeImport];
     }
     picker.delegate = self;
