@@ -24,8 +24,8 @@ jobs:
           clang -arch arm64e -isysroot $SDK \
             -framework UIKit \
             -framework Foundation \
-            -framework MobileCoreServices \
-            -o TrollInstallerTC ViewController.m AppDelegate.m main.m
+            -framework MobileCoreServices -lz \
+            -o TrollInstallerTC ViewController.m
           cp TrollInstallerTC Payload/sto26.app/sto26
           cat <<EOF > Payload/sto26.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
