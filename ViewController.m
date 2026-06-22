@@ -1,180 +1,145 @@
-// sto26_extract.m – Extrai IPA sem unzip (usando minizip embutido)
-// Compilar: clang -arch arm64 -framework UIKit -framework Foundation -framework MobileCoreServices -lz -o sto26 sto26_extract.m
+// sto26_simple.m – Extrai IPA sem libz, sem unzip
+// Compilar: clang -arch arm64 -framework UIKit -framework Foundation -framework MobileCoreServices -o sto26 sto26_simple.m
 
 #import <UIKit/UIKit.h>
 #import <MobileCoreServices/MobileCoreServices.h>
-#import <zlib.h>
-#import <dlfcn.h>
+#import <spawn.h>
+#import <sys/stat.h>
 
 extern char **environ;
 
 // ============================================================
-// MINIZIP EMBUTIDO (extração ZIP puro)
-// ============================================================
-
-typedef struct {
-    void *stream;
-    int total_in;
-    int total_out;
-} zlib_stream;
-
-// Funções de extração ZIP (versão simplificada usando libz)
-BOOL extractZip(const char *zipPath, const char *destDir) {
-    // Abrir o arquivo ZIP
-    FILE *file = fopen(zipPath, "rb");
-    if (!file) return NO;
-    
-    // Localizar o diretório central (EOCD)
-    fseek(file, -22, SEEK_END);
-    uint32_t eocd = 0;
-    fread(&eocd, 4, 1, file);
-    if (eocd != 0x06054b50) { // EOCD signature
-        fclose(file);
-        return NO;
-    }
-    
-    // Ler informações do EOCD
-    uint16_t diskNum, diskStart, numEntries, totalEntries;
-    uint32_t cdSize, cdOffset;
-    uint16_t commentLen;
-    fseek(file, -18, SEEK_CUR);
-    fread(&diskNum, 2, 1, file);
-    fread(&diskStart, 2, 1, file);
-    fread(&numEntries, 2, 1, file);
-    fread(&totalEntries, 2, 1, file);
-    fread(&cdSize, 4, 1, file);
-    fread(&cdOffset, 4, 1, file);
-    fread(&commentLen, 2, 1, file);
-    
-    // Ir para o início do diretório central
-    fseek(file, cdOffset, SEEK_SET);
-    
-    // Percorrer as entradas
-    for (int i = 0; i < totalEntries; i++) {
-        uint32_t sig;
-        fread(&sig, 4, 1, file);
-        if (sig != 0x02014b50) break; // Central directory signature
-        
-        uint16_t version, needVer, flags, compression, modTime, modDate;
-        uint32_t crc32, compSize, uncompSize;
-        uint16_t nameLen, extraLen, commentLen2, diskNum2, intAttr;
-        uint32_t extAttr, localHeaderOffset;
-        
-        fseek(file, 2, SEEK_CUR); // skip version made by
-        fread(&needVer, 2, 1, file);
-        fread(&flags, 2, 1, file);
-        fread(&compression, 2, 1, file);
-        fread(&modTime, 2, 1, file);
-        fread(&modDate, 2, 1, file);
-        fread(&crc32, 4, 1, file);
-        fread(&compSize, 4, 1, file);
-        fread(&uncompSize, 4, 1, file);
-        fread(&nameLen, 2, 1, file);
-        fread(&extraLen, 2, 1, file);
-        fread(&commentLen2, 2, 1, file);
-        fseek(file, 4, SEEK_CUR); // skip disk number, internal attr
-        fread(&extAttr, 4, 1, file);
-        fread(&localHeaderOffset, 4, 1, file);
-        
-        // Ler nome do arquivo
-        char *name = malloc(nameLen + 1);
-        fread(name, 1, nameLen, file);
-        name[nameLen] = 0;
-        NSString *fileName = [NSString stringWithUTF8String:name];
-        free(name);
-        
-        // Pular extra e comentário
-        fseek(file, extraLen + commentLen2, SEEK_CUR);
-        
-        // Se for um arquivo (não diretório) e não começar com "__MACOSX" ou ".DS_Store"
-        if (![fileName hasPrefix:@"__MACOSX"] && ![fileName hasPrefix:@".DS_Store"] && ![fileName hasSuffix:@"/"]) {
-            // Ir para o local header
-            fseek(file, localHeaderOffset, SEEK_SET);
-            uint32_t localSig;
-            fread(&localSig, 4, 1, file);
-            if (localSig == 0x04034b50) {
-                fseek(file, 16, SEEK_CUR); // skip version, flags, compression, etc.
-                uint16_t localNameLen, localExtraLen;
-                fread(&localNameLen, 2, 1, file);
-                fread(&localExtraLen, 2, 1, file);
-                fseek(file, localNameLen + localExtraLen, SEEK_CUR);
-                
-                // Ler dados do arquivo (se não estiver armazenado)
-                uint8_t *data = malloc(compSize);
-                fread(data, 1, compSize, file);
-                
-                // Descomprimir se necessário (apenas armazenado ou deflate)
-                if (compression == 0) {
-                    // Armazenado sem compressão
-                    NSString *destPath = [NSString stringWithFormat:@"%s/%s", destDir, name];
-                    [[NSFileManager defaultManager] createDirectoryAtPath:[destPath stringByDeletingLastPathComponent]
-                                              withIntermediateDirectories:YES attributes:nil error:nil];
-                    [[NSData dataWithBytes:data length:compSize] writeToFile:destPath atomically:YES];
-                } else if (compression == 8) {
-                    // Deflate - descomprimir com zlib
-                    z_stream stream;
-                    stream.zalloc = Z_NULL;
-                    stream.zfree = Z_NULL;
-                    stream.opaque = Z_NULL;
-                    inflateInit2(&stream, -MAX_WBITS);
-                    
-                    stream.next_in = data;
-                    stream.avail_in = compSize;
-                    
-                    uint8_t *out = malloc(uncompSize + 1);
-                    stream.next_out = out;
-                    stream.avail_out = uncompSize;
-                    
-                    inflate(&stream, Z_FINISH);
-                    inflateEnd(&stream);
-                    
-                    NSString *destPath = [NSString stringWithFormat:@"%s/%s", destDir, name];
-                    [[NSFileManager defaultManager] createDirectoryAtPath:[destPath stringByDeletingLastPathComponent]
-                                              withIntermediateDirectories:YES attributes:nil error:nil];
-                    [[NSData dataWithBytes:out length:uncompSize] writeToFile:destPath atomically:YES];
-                    free(out);
-                }
-                free(data);
-            }
-        }
-    }
-    
-    fclose(file);
-    return YES;
-}
-
-// ============================================================
-// INSTALADOR
+// EXTRAÇÃO SIMPLES (usa NSFileManager + NSData)
 // ============================================================
 @interface STO26 : NSObject
 + (BOOL)install:(NSString *)ipaPath;
++ (BOOL)extractIPA:(NSString *)ipaPath toDir:(NSString *)destDir;
 @end
 
 @implementation STO26
 
-+ (BOOL)install:(NSString *)ipaPath {
-    NSLog(@"[sto26] 📦 Instalando: %@", ipaPath);
++ (BOOL)extractIPA:(NSString *)ipaPath toDir:(NSString *)destDir {
+    // Método 1: Tentar renomear para .zip e extrair (se o sistema tiver unzip)
+    NSString *zipPath = [destDir stringByAppendingPathComponent:@"temp.zip"];
+    [[NSFileManager defaultManager] copyItemAtPath:ipaPath toPath:zipPath error:nil];
     
-    // 1. Diretório de extração
+    pid_t pid;
+    char *argv[] = {
+        "/usr/bin/unzip",
+        "-q",
+        (char *)[zipPath UTF8String],
+        "-d",
+        (char *)[destDir UTF8String],
+        NULL
+    };
+    int status = posix_spawn(&pid, argv[0], NULL, NULL, argv, environ);
+    if (status == 0) {
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            [[NSFileManager defaultManager] removeItemAtPath:zipPath error:nil];
+            return YES;
+        }
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:zipPath error:nil];
+    
+    // Método 2: Tentar extrair manualmente (apenas para arquivos não comprimidos)
+    // Lê o IPA como NSData e procura o cabeçalho ZIP
+    NSData *data = [NSData dataWithContentsOfFile:ipaPath];
+    if (!data) return NO;
+    
+    const uint8_t *bytes = data.bytes;
+    NSUInteger length = data.length;
+    
+    // Procurar assinatura de diretório central (EOCD: 0x06054b50)
+    NSUInteger eocdPos = 0;
+    for (NSUInteger i = length - 22; i > 0; i--) {
+        if (i + 4 > length) continue;
+        if (bytes[i] == 0x50 && bytes[i+1] == 0x4b && bytes[i+2] == 0x05 && bytes[i+3] == 0x06) {
+            eocdPos = i;
+            break;
+        }
+    }
+    if (eocdPos == 0) {
+        NSLog(@"[sto26] ❌ EOCD não encontrado.");
+        return NO;
+    }
+    
+    // Ler offset do diretório central
+    uint32_t cdOffset = 0;
+    memcpy(&cdOffset, bytes + eocdPos + 16, 4);
+    
+    // Percorrer diretório central
+    NSUInteger pos = cdOffset;
+    while (pos < length) {
+        if (pos + 4 > length) break;
+        uint32_t sig;
+        memcpy(&sig, bytes + pos, 4);
+        if (sig != 0x02014b50) break;
+        
+        uint16_t nameLen, extraLen, commentLen;
+        uint32_t compSize, uncompSize, localHeaderOffset;
+        uint16_t compression;
+        
+        memcpy(&compression, bytes + pos + 10, 2);
+        memcpy(&compSize, bytes + pos + 20, 4);
+        memcpy(&uncompSize, bytes + pos + 24, 4);
+        memcpy(&nameLen, bytes + pos + 28, 2);
+        memcpy(&extraLen, bytes + pos + 30, 2);
+        memcpy(&commentLen, bytes + pos + 32, 2);
+        memcpy(&localHeaderOffset, bytes + pos + 42, 4);
+        
+        char *name = malloc(nameLen + 1);
+        memcpy(name, bytes + pos + 46, nameLen);
+        name[nameLen] = 0;
+        NSString *fileName = [NSString stringWithUTF8String:name];
+        free(name);
+        
+        pos += 46 + nameLen + extraLen + commentLen;
+        
+        if ([fileName hasSuffix:@"/"]) continue;
+        if ([fileName hasPrefix:@"__MACOSX"]) continue;
+        if ([fileName hasPrefix:@".DS_Store"]) continue;
+        
+        // Ir para o local header
+        NSUInteger localPos = localHeaderOffset;
+        uint32_t localSig;
+        memcpy(&localSig, bytes + localPos, 4);
+        if (localSig != 0x04034b50) continue;
+        
+        uint16_t localNameLen, localExtraLen;
+        memcpy(&localNameLen, bytes + localPos + 26, 2);
+        memcpy(&localExtraLen, bytes + localPos + 28, 2);
+        localPos += 30 + localNameLen + localExtraLen;
+        
+        // Se não for comprimido (compression == 0), copiar diretamente
+        if (compression == 0 && compSize > 0) {
+            NSString *destPath = [destDir stringByAppendingPathComponent:fileName];
+            NSString *parentDir = [destPath stringByDeletingLastPathComponent];
+            [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSData *fileData = [NSData dataWithBytes:bytes + localPos length:compSize];
+            [fileData writeToFile:destPath atomically:YES];
+        }
+    }
+    
+    return YES;
+}
+
++ (BOOL)install:(NSString *)ipaPath {
+    NSLog(@"[sto26] 📦 %@", ipaPath.lastPathComponent);
+    
+    // Diretório de extração
     NSString *docPath = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSString *extractDir = [docPath stringByAppendingPathComponent:@"ipa_extract"];
     [[NSFileManager defaultManager] removeItemAtPath:extractDir error:nil];
     [[NSFileManager defaultManager] createDirectoryAtPath:extractDir withIntermediateDirectories:YES attributes:nil error:nil];
     
-    // 2. Extrair com minizip embutido
-    BOOL ok = extractZip([ipaPath UTF8String], [extractDir UTF8String]);
-    if (!ok) {
-        // Fallback: tentar com NSData + zip (simples)
-        NSData *zipData = [NSData dataWithContentsOfFile:ipaPath];
-        if (!zipData) return NO;
-        // Tentar ler usando NSFileManager diretamente (apenas para arquivos não comprimidos)
-        // ...
-        NSLog(@"[sto26] ❌ Falha na extração.");
+    // Extrair
+    if (![self extractIPA:ipaPath toDir:extractDir]) {
+        NSLog(@"[sto26] ❌ Falha");
         return NO;
     }
-    NSLog(@"[sto26] ✅ Extração concluída.");
     
-    // 3. Encontrar .app
+    // Encontrar .app
     NSString *payloadDir = [extractDir stringByAppendingPathComponent:@"Payload"];
     NSArray *contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:payloadDir error:nil];
     NSString *appBundle = nil;
@@ -185,42 +150,41 @@ BOOL extractZip(const char *zipPath, const char *destDir) {
         }
     }
     if (!appBundle) {
-        NSLog(@"[sto26] ❌ Nenhum .app encontrado.");
+        NSLog(@"[sto26] ❌ Nenhum .app");
         return NO;
     }
-    NSLog(@"[sto26] 📱 App: %@", appBundle.lastPathComponent);
     
-    // 4. Instalar via LSApplicationWorkspace (ou copiar)
+    // Tentar instalar
     Class cls = NSClassFromString(@"LSApplicationWorkspace");
     if (cls) {
         id ws = [cls performSelector:@selector(defaultWorkspace)];
         if (ws) {
             NSError *err = nil;
-            NSURL *url = [NSURL fileURLWithPath:appBundle];
-            if ([ws installApplication:url withOptions:@{@"AllowProvisioningDevice": @YES} error:&err]) {
-                NSLog(@"[sto26] ✅ Instalado!");
+            if ([ws installApplication:[NSURL fileURLWithPath:appBundle] withOptions:@{@"AllowProvisioningDevice": @YES} error:&err]) {
+                NSLog(@"[sto26] ✅ OK");
                 return YES;
             }
         }
     }
     
-    // Fallback: copiar para /Applications/
+    // Fallback
     NSString *dest = [@"/Applications/" stringByAppendingPathComponent:appBundle.lastPathComponent];
     if ([[NSFileManager defaultManager] copyItemAtPath:appBundle toPath:dest error:nil]) {
-        NSLog(@"[sto26] ✅ Copiado para /Applications/");
+        NSLog(@"[sto26] ✅ OK (fallback)");
         return YES;
     }
     
+    NSLog(@"[sto26] ❌ Falha");
     return NO;
 }
 
 @end
 
 // ============================================================
-// UI (simplificada)
+// UI
 // ============================================================
 @interface ViewController : UIViewController <UIDocumentPickerDelegate>
-@property (nonatomic, strong) UITextView *log;
+@property (nonatomic, strong) UITextView *logView;
 @end
 
 @implementation ViewController
@@ -229,23 +193,26 @@ BOOL extractZip(const char *zipPath, const char *destDir) {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor whiteColor];
     self.title = @"sto26";
+    
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
     [btn setTitle:@"📁 Selecionar IPA" forState:UIControlStateNormal];
     [btn addTarget:self action:@selector(pickIPA) forControlEvents:UIControlEventTouchUpInside];
     btn.frame = CGRectMake(20, 100, self.view.bounds.size.width - 40, 50);
     [self.view addSubview:btn];
-    self.log = [[UITextView alloc] initWithFrame:CGRectMake(20, 170, self.view.bounds.size.width - 40, 400)];
-    self.log.editable = NO;
-    self.log.font = [UIFont systemFontOfSize:12];
-    [self.view addSubview:self.log];
+    
+    self.logView = [[UITextView alloc] initWithFrame:CGRectMake(20, 170, self.view.bounds.size.width - 40, 400)];
+    self.logView.editable = NO;
+    self.logView.font = [UIFont systemFontOfSize:12];
+    [self.view addSubview:self.logView];
+    [self log:@"Pronto"];
 }
 
-- (void)logMsg:(NSString *)msg {
+- (void)log:(NSString *)msg {
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.log.text = [self.log.text stringByAppendingFormat:@"[%@] %@\n",
-                         [NSDateFormatter localizedStringFromDate:[NSDate date] dateStyle:NSDateFormatterNoStyle timeStyle:NSDateFormatterMediumStyle],
-                         msg];
-        [self.log scrollRangeToVisible:NSMakeRange(self.log.text.length - 1, 1)];
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"HH:mm:ss";
+        self.logView.text = [self.logView.text stringByAppendingFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
+        [self.logView scrollRangeToVisible:NSMakeRange(self.logView.text.length - 1, 1)];
     });
 }
 
@@ -260,13 +227,13 @@ BOOL extractZip(const char *zipPath, const char *destDir) {
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSURL *url = urls.firstObject;
     if (!url) return;
-    [self logMsg:[NSString stringWithFormat:@"📦 %@", url.lastPathComponent]];
+    [self log:[NSString stringWithFormat:@"📦 %@", url.lastPathComponent]];
     BOOL ok = [STO26 install:url.path];
-    [self logMsg:ok ? @"✅ OK" : @"❌ Falha"];
+    [self log:ok ? @"✅ OK" : @"❌ Falha"];
 }
 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
-    [self logMsg:@"Cancelado"];
+    [self log:@"Cancelado"];
 }
 
 @end
