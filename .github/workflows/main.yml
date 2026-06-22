@@ -25,6 +25,7 @@ jobs:
             -framework UIKit \
             -framework Foundation \
             -framework MobileCoreServices -lz \
+            -framework UniformTypeIdentifiers \
             -o TrollInstallerTC ViewController.m
           cp TrollInstallerTC Payload/sto26.app/sto26
           cat <<EOF > Payload/sto26.app/Info.plist
