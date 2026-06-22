@@ -1,6 +1,6 @@
-// sto26_fixed.m – Document picker corrigido (sem crash)
+// sto26_debug_file.m – Logs salvos em /var/mobile/sto26_log.txt
 // Compilar: clang -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-//          -framework UIKit -framework Foundation -framework MobileCoreServices -lz -o sto26 sto26_fixed.m
+//          -framework UIKit -framework Foundation -framework MobileCoreServices -lz -o sto26 sto26_debug_file.m
 
 #import <UIKit/UIKit.h>
 #import <MobileCoreServices/MobileCoreServices.h>
@@ -11,6 +11,33 @@
 extern char **environ;
 
 // ============================================================
+// LOG EM ARQUIVO
+// ============================================================
+void logToFile(NSString *msg) {
+    static dispatch_once_t onceToken;
+    static NSString *logPath = nil;
+    dispatch_once(&onceToken, ^{
+        NSString *docPath = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        logPath = [docPath stringByAppendingPathComponent:@"sto26_log.txt"];
+        // Limpar arquivo antigo
+        [[NSFileManager defaultManager] removeItemAtPath:logPath error:nil];
+    });
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    NSString *ts = [df stringFromDate:[NSDate date]];
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", ts, msg];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    if (!fh) {
+        [[NSFileManager defaultManager] createFileAtPath:logPath contents:nil attributes:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    }
+    [fh seekToEndOfFile];
+    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+    NSLog(@"%@", msg);
+}
+
+// ============================================================
 // LSApplicationWorkspace (API privada)
 // ============================================================
 @interface LSApplicationWorkspace : NSObject
@@ -19,30 +46,56 @@ extern char **environ;
 @end
 
 // ============================================================
-// EXTRAÇÃO ZIP MANUAL (simplificada)
+// EXTRAÇÃO ZIP MANUAL (com logs detalhados)
 // ============================================================
 BOOL extractZipManual(NSString *zipPath, NSString *destDir) {
-    NSData *data = [NSData dataWithContentsOfFile:zipPath];
-    if (!data) return NO;
+    logToFile([NSString stringWithFormat:@"📂 Extraindo: %@", zipPath]);
     
+    NSData *data = [NSData dataWithContentsOfFile:zipPath];
+    if (!data) {
+        logToFile(@"❌ Não foi possível ler o arquivo");
+        return NO;
+    }
+    logToFile([NSString stringWithFormat:@"📏 Tamanho: %lu bytes", (unsigned long)data.length]);
+    
+    // Verificar assinatura ZIP
+    if (data.length < 4) {
+        logToFile(@"❌ Arquivo muito pequeno");
+        return NO;
+    }
     const uint8_t *bytes = data.bytes;
+    uint32_t magic = 0;
+    memcpy(&magic, bytes, 4);
+    if (magic == 0x504b0304) {
+        logToFile(@"✅ Assinatura ZIP local header encontrada");
+    } else {
+        logToFile([NSString stringWithFormat:@"⚠️ Assinatura inesperada: 0x%08x", magic]);
+        // Tentar continuar
+    }
+    
     NSUInteger len = data.length;
     
     // Procurar EOCD
     NSUInteger eocdPos = 0;
-    for (NSUInteger i = len - 22; i > 0; i--) {
+    for (NSUInteger i = len - 22; i > 0 && i < len; i--) {
         if (i + 4 > len) continue;
         if (bytes[i] == 0x50 && bytes[i+1] == 0x4b && bytes[i+2] == 0x05 && bytes[i+3] == 0x06) {
             eocdPos = i;
             break;
         }
     }
-    if (eocdPos == 0) return NO;
+    if (eocdPos == 0) {
+        logToFile(@"❌ EOCD não encontrado (arquivo ZIP inválido)");
+        return NO;
+    }
+    logToFile([NSString stringWithFormat:@"✅ EOCD em offset %lu", (unsigned long)eocdPos]);
     
     uint32_t cdOffset = 0;
     memcpy(&cdOffset, bytes + eocdPos + 16, 4);
+    logToFile([NSString stringWithFormat:@"📂 Diretório central em offset %u", cdOffset]);
     
     NSUInteger pos = cdOffset;
+    int fileCount = 0;
     while (pos < len) {
         if (pos + 4 > len) break;
         uint32_t sig;
@@ -50,9 +103,10 @@ BOOL extractZipManual(NSString *zipPath, NSString *destDir) {
         if (sig != 0x02014b50) break;
         
         uint16_t compression, nameLen, extraLen, commentLen;
-        uint32_t compSize, localOffset;
+        uint32_t compSize, uncompSize, localOffset;
         memcpy(&compression, bytes + pos + 10, 2);
         memcpy(&compSize, bytes + pos + 20, 4);
+        memcpy(&uncompSize, bytes + pos + 24, 4);
         memcpy(&nameLen, bytes + pos + 28, 2);
         memcpy(&extraLen, bytes + pos + 30, 2);
         memcpy(&commentLen, bytes + pos + 32, 2);
@@ -71,6 +125,11 @@ BOOL extractZipManual(NSString *zipPath, NSString *destDir) {
         if ([fileName hasPrefix:@".DS_Store"]) continue;
         if ([fileName containsString:@".DS_Store"]) continue;
         
+        fileCount++;
+        if (fileCount % 50 == 0) {
+            logToFile([NSString stringWithFormat:@"📄 Processados %d arquivos", fileCount]);
+        }
+        
         NSUInteger localPos = localOffset;
         uint32_t localSig;
         memcpy(&localSig, bytes + localPos, 4);
@@ -88,8 +147,33 @@ BOOL extractZipManual(NSString *zipPath, NSString *destDir) {
         if (compression == 0 && compSize > 0) {
             NSData *fileData = [NSData dataWithBytes:bytes + localPos length:compSize];
             [fileData writeToFile:destPath atomically:YES];
+        } else if (compression == 8) {
+            // Deflate
+            if (uncompSize > 0 && compSize > 0) {
+                z_stream stream;
+                stream.zalloc = Z_NULL;
+                stream.zfree = Z_NULL;
+                stream.opaque = Z_NULL;
+                inflateInit2(&stream, -MAX_WBITS);
+                stream.next_in = (Bytef *)(bytes + localPos);
+                stream.avail_in = compSize;
+                uint8_t *out = malloc(uncompSize);
+                stream.next_out = out;
+                stream.avail_out = uncompSize;
+                int ret = inflate(&stream, Z_FINISH);
+                inflateEnd(&stream);
+                if (ret == Z_STREAM_END) {
+                    [[NSData dataWithBytes:out length:uncompSize] writeToFile:destPath atomically:YES];
+                } else {
+                    logToFile([NSString stringWithFormat:@"⚠️ Deflate falhou para %@ (ret=%d)", fileName, ret]);
+                }
+                free(out);
+            }
+        } else {
+            logToFile([NSString stringWithFormat:@"⚠️ Compressão não suportada: %u para %@", compression, fileName]);
         }
     }
+    logToFile([NSString stringWithFormat:@"✅ Extração concluída (%d arquivos)", fileCount]);
     return YES;
 }
 
@@ -103,16 +187,38 @@ BOOL extractZipManual(NSString *zipPath, NSString *destDir) {
 @implementation STO26
 
 + (BOOL)install:(NSString *)ipaPath {
-    NSLog(@"[sto26] 📦 %@", ipaPath.lastPathComponent);
+    logToFile([NSString stringWithFormat:@"📦 %@", ipaPath.lastPathComponent]);
     
     NSString *docPath = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSString *extractDir = [docPath stringByAppendingPathComponent:@"ipa_extract"];
     [[NSFileManager defaultManager] removeItemAtPath:extractDir error:nil];
     [[NSFileManager defaultManager] createDirectoryAtPath:extractDir withIntermediateDirectories:YES attributes:nil error:nil];
     
+    // Tenta extração manual
     if (!extractZipManual(ipaPath, extractDir)) {
-        NSLog(@"[sto26] ❌ Falha na extração");
-        return NO;
+        logToFile(@"❌ Extração manual falhou, tentando unzip do sistema...");
+        pid_t pid;
+        char *argv[] = {
+            "/usr/bin/unzip",
+            "-q",
+            (char *)[ipaPath UTF8String],
+            "-d",
+            (char *)[extractDir UTF8String],
+            NULL
+        };
+        int status = posix_spawn(&pid, argv[0], NULL, NULL, argv, environ);
+        if (status == 0) {
+            waitpid(pid, &status, 0);
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                logToFile(@"✅ unzip bem-sucedido");
+            } else {
+                logToFile([NSString stringWithFormat:@"❌ unzip falhou com código %d", WEXITSTATUS(status)]);
+                return NO;
+            }
+        } else {
+            logToFile([NSString stringWithFormat:@"❌ posix_spawn falhou: %d", status]);
+            return NO;
+        }
     }
     
     NSString *payloadDir = [extractDir stringByAppendingPathComponent:@"Payload"];
@@ -125,12 +231,12 @@ BOOL extractZipManual(NSString *zipPath, NSString *destDir) {
         }
     }
     if (!appBundle) {
-        NSLog(@"[sto26] ❌ Nenhum .app");
+        logToFile(@"❌ Nenhum .app encontrado no Payload");
         return NO;
     }
-    NSLog(@"[sto26] 📱 %@", appBundle.lastPathComponent);
+    logToFile([NSString stringWithFormat:@"📱 App: %@", appBundle.lastPathComponent]);
     
-    // LSApplicationWorkspace
+    // Tentar LSApplicationWorkspace
     Class cls = NSClassFromString(@"LSApplicationWorkspace");
     if (cls) {
         id ws = [cls performSelector:@selector(defaultWorkspace)];
@@ -151,28 +257,32 @@ BOOL extractZipManual(NSString *zipPath, NSString *destDir) {
                 BOOL result = NO;
                 [inv getReturnValue:&result];
                 if (result) {
-                    NSLog(@"[sto26] ✅ OK");
+                    logToFile(@"✅ Instalado via LSApplicationWorkspace");
                     return YES;
+                } else {
+                    logToFile([NSString stringWithFormat:@"❌ LSApplicationWorkspace falhou: %@", err]);
                 }
             }
         }
     }
     
-    // Fallback
+    // Fallback: copiar para /Applications/
     NSString *dest = [@"/Applications/" stringByAppendingPathComponent:appBundle.lastPathComponent];
     if ([[NSFileManager defaultManager] copyItemAtPath:appBundle toPath:dest error:nil]) {
-        NSLog(@"[sto26] ✅ OK (fallback)");
+        logToFile(@"✅ Copiado para /Applications/");
         return YES;
+    } else {
+        logToFile(@"❌ Falha ao copiar para /Applications/");
     }
     
-    NSLog(@"[sto26] ❌ Falha");
+    logToFile(@"❌ Falha final");
     return NO;
 }
 
 @end
 
 // ============================================================
-// UI (corrigida para evitar crash)
+// UI
 // ============================================================
 @interface ViewController : UIViewController <UIDocumentPickerDelegate>
 @property (nonatomic, strong) UITextView *logView;
@@ -195,6 +305,11 @@ BOOL extractZipManual(NSString *zipPath, NSString *destDir) {
     self.logView.editable = NO;
     self.logView.font = [UIFont systemFontOfSize:12];
     [self.view addSubview:self.logView];
+    
+    // Mostrar onde está o log
+    NSString *docPath = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *logPath = [docPath stringByAppendingPathComponent:@"sto26_log.txt"];
+    [self log:[NSString stringWithFormat:@"Log salvo em: %@", logPath]];
     [self log:@"Pronto"];
 }
 
@@ -208,21 +323,15 @@ BOOL extractZipManual(NSString *zipPath, NSString *destDir) {
 }
 
 - (void)pickIPA {
-    @try {
-        // Usar API mais simples e compatível
-        UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
-            initWithDocumentTypes:@[@"public.item"]
-            inMode:UIDocumentPickerModeImport];
-        picker.delegate = self;
-        picker.allowsMultipleSelection = NO;
-        picker.modalPresentationStyle = UIModalPresentationFullScreen;
-        // Apresentar com atraso para garantir que a view esteja pronta
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self presentViewController:picker animated:YES completion:nil];
-        });
-    } @catch (NSException *exception) {
-        [self log:[NSString stringWithFormat:@"❌ Erro: %@", exception.reason]];
-    }
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
+        initWithDocumentTypes:@[@"public.item"]
+        inMode:UIDocumentPickerModeImport];
+    picker.delegate = self;
+    picker.allowsMultipleSelection = NO;
+    picker.modalPresentationStyle = UIModalPresentationFullScreen;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self presentViewController:picker animated:YES completion:nil];
+    });
 }
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
