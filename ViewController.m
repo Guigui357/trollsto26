@@ -1,4 +1,4 @@
-p// sto26_debug.m – Extração ZIP com logs detalhados
+// sto26_debug.m – Extração ZIP com logs detalhados
 // Compilar: clang -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
 //          -framework UIKit -framework Foundation -framework MobileCoreServices -lz -o sto26 sto26_debug.m
 
